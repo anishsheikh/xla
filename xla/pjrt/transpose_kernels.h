@@ -33,9 +33,17 @@ limitations under the License.
 #define XLA_HAS_SSE2
 #endif
 
-#if defined(__ARM_NEON) && !defined(__ARM_BIG_ENDIAN)
+#if defined(_M_ARM64) || defined(_M_ARM64EC)
+#define XLA_HAS_ARM64
 #define XLA_HAS_ARM_NEON
-#endif
+#elif defined(__ARM_NEON) && !defined(__ARM_BIG_ENDIAN)
+#define XLA_HAS_ARM_NEON
+
+#if defined(__aarch64__)
+#define XLA_HAS_ARM64
+#endif  // defined(__aarch64__)
+
+#endif  // defined(_M_ARM64) || defined(_M_ARM64EC)
 
 #ifdef XLA_HAS_SSE2
 #include <immintrin.h>  // IWYU pragma: keep
@@ -43,11 +51,11 @@ limitations under the License.
 
 #ifdef XLA_HAS_ARM_NEON
 #include <arm_neon.h>
-#endif
+#endif  // XLA_HAS_ARM_NEON
 
 #if defined(XLA_HAS_SSE2) || defined(XLA_HAS_ARM_NEON)
 #define XLA_HAS_VEC128
-#endif
+#endif  // defined(XLA_HAS_SSE2) || defined(XLA_HAS_ARM_NEON)
 
 namespace xla {
 

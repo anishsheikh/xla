@@ -74,6 +74,7 @@ limitations under the License.
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <numeric>
 #include <stack>
@@ -85,6 +86,7 @@ limitations under the License.
 #include <vector>
 
 #include "absl/algorithm/container.h"
+#include "absl/base/optimization.h"
 #include "absl/strings/str_format.h"
 #include "absl/strings/str_join.h"
 #include "absl/synchronization/blocking_counter.h"
@@ -134,9 +136,83 @@ struct TransposePlan::Node {
 };
 
 void ConvertF64ToEf57(const double* input, float* output, int n) {
-  // TODO(phawkins): vectorize this transformation.
+#ifdef __AVX__
+  constexpr int kDoublesPerAvxIteration = sizeof(__m256d) / sizeof(double);
+  constexpr int kFloatsPerAvxIteration = sizeof(__m256) / sizeof(float);
+  constexpr int kFloatsPerSseRegister = sizeof(__m128) / sizeof(float);
+  while (n >= kDoublesPerAvxIteration) {
+    __m256d x = _mm256_load_pd(input);
+
+    __m128 x_hi_f32 = _mm256_cvtpd_ps(x);
+    __m256d x_hi_f64 = _mm256_cvtps_pd(x_hi_f32);
+    __m256d x_lo_f64 = _mm256_sub_pd(x, x_hi_f64);
+    __m128 x_lo_f32 = _mm256_cvtpd_ps(x_lo_f64);
+
+    const __m128 inf = _mm_set1_ps(std::numeric_limits<float>::infinity());
+    __m128 x_hi_exponent = _mm_and_ps(x_hi_f32, inf);
+    __m128 x_is_finite = _mm_cmplt_ps(x_hi_exponent, inf);
+    x_lo_f32 = _mm_and_ps(x_lo_f32, x_is_finite);
+
+    _mm_storeu_ps(output + 0, _mm_unpacklo_ps(x_hi_f32, x_lo_f32));
+    _mm_storeu_ps(output + kFloatsPerSseRegister,
+                  _mm_unpackhi_ps(x_hi_f32, x_lo_f32));
+
+    n -= kDoublesPerAvxIteration;
+    input += kDoublesPerAvxIteration;
+    output += kFloatsPerAvxIteration;
+  }
+#endif
+#ifdef XLA_HAS_SSE2
+  constexpr int kDoublesPerSseIteration = sizeof(__m128d) / sizeof(double);
+  constexpr int kFloatsPerSseIteration = sizeof(__m128) / sizeof(float);
+  while (n >= kDoublesPerSseIteration) {
+    __m128d x = _mm_loadu_pd(input);
+    __m128 x_hi_f32 = _mm_cvtpd_ps(x);
+    __m128d x_hi_f64 = _mm_cvtps_pd(x_hi_f32);
+    __m128d x_lo_f64 = _mm_sub_pd(x, x_hi_f64);
+    __m128 x_lo_f32 = _mm_cvtpd_ps(x_lo_f64);
+
+    const __m128 inf = _mm_set1_ps(std::numeric_limits<float>::infinity());
+    __m128 x_hi_exponent = _mm_and_ps(x_hi_f32, inf);
+    __m128 x_is_finite = _mm_cmplt_ps(x_hi_exponent, inf);
+    x_lo_f32 = _mm_and_ps(x_lo_f32, x_is_finite);
+
+    __m128 to_store = _mm_unpacklo_ps(x_hi_f32, x_lo_f32);
+    _mm_storeu_ps(output, to_store);
+
+    n -= kDoublesPerSseIteration;
+    input += kDoublesPerSseIteration;
+    output += kFloatsPerSseIteration;
+  }
+#endif
+#if defined(XLA_HAS_ARM_NEON) && defined(XLA_HAS_ARM64)
+  constexpr int kDoublesPerNeonIteration = sizeof(float64x2_t) / sizeof(double);
+  constexpr int kFloatsPerNeonIteration = sizeof(float32x2x2_t) / sizeof(float);
+  while (n >= kDoublesPerNeonIteration) {
+    float64x2_t x = vld1q_f64(input);
+    float32x2_t x_hi_f32 = vcvt_f32_f64(x);
+    float64x2_t x_hi_f64 = vcvt_f64_f32(x_hi_f32);
+    float64x2_t x_lo_f64 = vsubq_f64(x, x_hi_f64);
+    float32x2_t x_lo_f32 = vcvt_f32_f64(x_lo_f64);
+
+    uint32x2_t x_is_finite =
+        vcalt_f32(x_hi_f32, vdup_n_f32(std::numeric_limits<float>::infinity()));
+    x_lo_f32 = vand_u32(x_lo_f32, x_is_finite);
+
+    float32x2x2_t to_store;
+    to_store.val[0] = x_hi_f32;
+    to_store.val[1] = x_lo_f32;
+    vst2_f32(output, to_store);
+
+    n -= kDoublesPerNeonIteration;
+    input += kDoublesPerNeonIteration;
+    output += kFloatsPerNeonIteration;
+  }
+#endif
+
   for (int i = 0; i < n; ++i) {
-    std::tie(output[0], output[1]) = SplitF64ToF32(*input);
+    std::tie(output[0], output[1]) =
+        SplitF64ToF32</*kWarnOnOverflow=*/false>(*input);
     ++input;
     output += 2;
   }
@@ -156,10 +232,16 @@ void MacroKernel(const char* __restrict a, int64_t lda, int outer_bs_a,
   if constexpr (transformation == TransposePlan::Transformation::kF64ToEf57) {
     DCHECK_EQ(outer_bs_a * inner_bs % 2, 0);
     float* p = reinterpret_cast<float*>(scratch);
-    for (int i = 0; i < outer_bs_b * inner_bs; ++i) {
-      ConvertF64ToEf57(reinterpret_cast<const double*>(a + lda * i),
-                       p + outer_bs_a * inner_bs * i,
-                       outer_bs_a * inner_bs / 2);
+    if (ABSL_PREDICT_TRUE(lda == sizeof(double) &&
+                          outer_bs_a * inner_bs == 2)) {
+      ConvertF64ToEf57(reinterpret_cast<const double*>(a), p,
+                       outer_bs_b * inner_bs);
+    } else {
+      for (int i = 0; i < outer_bs_b * inner_bs; ++i) {
+        ConvertF64ToEf57(reinterpret_cast<const double*>(a + lda * i),
+                         p + outer_bs_a * inner_bs * i,
+                         outer_bs_a * inner_bs / 2);
+      }
     }
     a = reinterpret_cast<const char*>(scratch);
     lda = outer_bs_a * inner_bs * sizeof(float);

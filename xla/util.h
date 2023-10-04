@@ -21,6 +21,7 @@ limitations under the License.
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -715,15 +716,55 @@ Status EraseElementFromVector(std::vector<T>* container, const T& value) {
   return OkStatus();
 }
 
-// Utility function which splits a double-precision float (F64) into a pair of
-// single-precision floating point numbers. The most significant 49 bits (out of
-// the total 53 available) in the mantissa of the F64 is represented as the
-// unevaluated sum of two non-overlapping single-precision F32s; the 'high' part
-// contains 24 bits in its mantissa, and the 'low' part contains 25 bits in its
-// sign bit and its mantissa.
-// Note: The resulting representation can still only represent 8-bit exponent
-// range that is available in F32s (out of a total of 11 exponent bits in F64s).
-std::pair<float, float> SplitF64ToF32(double x);
+// Utility function to split a double-precision float (F64) into a pair of F32s.
+// For a p-bit number, and a splitting point (p/2) <= s <= (p - 1), the
+// algorithm produces a (p - s)-bit value 'hi' and a non-overlapping (s - 1)-bit
+// value 'lo'. See Theorem 4 in [1] (attributed to Dekker) or [2] for the
+// original theorem by Dekker.
+//
+// For double-precision F64s, which contain a 53 bit mantissa (52 of them
+// explicit), we can represent the most significant 49 digits as the unevaluated
+// sum of two single-precision floats 'hi' and 'lo'. The 'hi' float stores the
+// most significant 24 bits and the sign bit of 'lo' together with its mantissa
+// store the remaining 25 bits. The exponent of the resulting representation is
+// still restricted to 8 bits of F32.
+//
+// References:
+// [1] A. Thall, Extended-Precision Floating-Point Numbers for GPU Computation,
+//     SIGGRAPH Research Posters, 2006.
+//     (http://andrewthall.org/papers/df64_qf128.pdf)
+// [2] T. J. Dekker, A floating point technique for extending the available
+//     precision, Numerische Mathematik, vol. 18, pp. 224–242, 1971.
+template <bool kWarnOnOverflow = true>
+std::pair<float, float> SplitF64ToF32(double x) {
+  const float x_f32 = static_cast<float>(x);
+
+  const bool result_is_finite = std::isfinite(x_f32);
+
+  // Early return if x is an infinity or NaN.
+  if (!result_is_finite) {
+    if constexpr (kWarnOnOverflow) {
+      // Only values within the range of F32 are supported, unless it is
+      // infinity. Small values with large negative exponents would be rounded
+      // to zero.
+      if (std::isfinite(x)) {
+        LOG(WARNING) << "Out of range F64 constant detected: " << x;
+      }
+    }
+  }
+
+  // The high float is simply the double rounded to the nearest float. Because
+  // we are rounding to nearest with ties to even, the error introduced in
+  // rounding is less than half an ULP in the high ULP.
+  const float hi = x_f32;
+  // We can compute the low term using Sterbenz' lemma: If a and b are two
+  // positive floating point numbers and a/2 ≤ b ≤ 2a, then their difference can
+  // be computed exactly.
+  // Note: the difference is computed exactly but is rounded to the nearest
+  // float which will introduce additional error.
+  const float lo = static_cast<float>(x - static_cast<double>(hi));
+  return std::make_pair(hi, result_is_finite ? lo : 0.0f);
+}
 
 // Takes a sequence of unpacked int4 values, such that every byte stores one
 // int4 value in the low-order four bits, and packs them so every byte stores
