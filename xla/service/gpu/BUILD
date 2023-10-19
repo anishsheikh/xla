@@ -583,6 +583,7 @@ cc_library(
     srcs = if_cuda_is_configured(["triton_autotuner.cc"]),
     hdrs = if_cuda_is_configured(["triton_autotuner.h"]),
     deps = if_cuda_is_configured([
+        ":matmul_utils",
         ":autotuner_compile_util",
         ":autotuner_util",
         ":backend_configs_cc",
@@ -600,6 +601,7 @@ cc_library(
         "@com_google_absl//absl/container:flat_hash_set",
         "@com_google_absl//absl/log:check",
         "@com_google_absl//absl/log",
+        "@com_google_absl//absl/numeric:bits",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/time",

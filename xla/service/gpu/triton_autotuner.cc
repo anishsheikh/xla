@@ -31,6 +31,7 @@ limitations under the License.
 #include "absl/container/flat_hash_set.h"
 #include "absl/log/check.h"
 #include "absl/log/log.h"
+#include "absl/numeric/bits.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
@@ -59,6 +60,7 @@ limitations under the License.
 #include "xla/service/gpu/gpu_fusible.h"
 #include "xla/service/gpu/instruction_fusion.h"
 #include "xla/service/gpu/ir_emission_utils.h"
+#include "xla/service/gpu/matmul_utils.h"
 #include "xla/service/gpu/split_k_gemm_rewriter.h"
 #include "xla/service/gpu/stream_executor_util.h"
 #include "xla/service/hlo_module_config.h"
@@ -290,7 +292,18 @@ std::vector<AutotuneResult::TritonGemmKey> GetExhaustiveMatmulAutotuneConfigs(
   return configs;
 }
 
+namespace {
+int64_t SmallestPowerOfTwoGE(int64_t value) {
+  constexpr int64_t kMaxRepresentablePowerOfTwo =
+      static_cast<int64_t>(uint64_t{1} << 62);
+  CHECK_GE(value, 0);
+  CHECK_LE(value, kMaxRepresentablePowerOfTwo);
+  return static_cast<int64_t>(absl::bit_ceil(static_cast<uint64_t>(value)));
+}
+}  // namespace
+
 std::vector<AutotuneResult::TritonGemmKey> GetFixedMatmulAutotuneConfigs(
+    const HloDotInstruction& dot,
     const se::CudaComputeCapability compute_capability, const int max_split_k) {
   std::vector<AutotuneResult::TritonGemmKey> configs = {
       GemmKey(32, 32, 256, 1, 1, 4), GemmKey(64, 32, 32, 16, 1, 4),
@@ -325,12 +338,54 @@ std::vector<AutotuneResult::TritonGemmKey> GetFixedMatmulAutotuneConfigs(
                        }),
         configs.end());
   }
+
+  // This is not a sharp upper limit, the actual m value can be much smaller
+  // based on how much of the m dimension is physically contiguous.
+  // TODO(tdanyluk): Get the exact m value by running a TritonFusionAnalysis.
+  const int64_t m = dot.operand(0)->shape().dimensions(
+      NonContractingDimensionIndex(dot, /*operand_number=*/0));
+  // Theoretically the same is true as for m, but that is not possible in
+  // practice with the current implementation.
+  const int64_t n = dot.operand(1)->shape().dimensions(
+      NonContractingDimensionIndex(dot, /*operand_number=*/1));
+  // This is before doing the split-k transform.
+  const int64_t k = dot.operand(0)->shape().dimensions(
+      ContractingDimensionIndex(dot, /*operand_number=*/0));
+  const int64_t block_m_limit = std::max<int64_t>(16, SmallestPowerOfTwoGE(m));
+  const int64_t block_n_limit = std::max<int64_t>(16, SmallestPowerOfTwoGE(n));
+  const int64_t block_k_limit = std::max<int64_t>(16, SmallestPowerOfTwoGE(k));
+
+  // Remove the configs where the split-k is too big relative to the k
+  // dimension or bigger than max_split_k.
   configs.erase(
-      std::remove_if(configs.begin(), configs.end(),
-                     [&](const AutotuneResult::TritonGemmKey& config) {
-                       return config.split_k() > max_split_k;
-                     }),
+      std::remove_if(
+          configs.begin(), configs.end(),
+          [&](const AutotuneResult::TritonGemmKey& config) {
+            const int64_t per_config_split_k_limit =
+                std::max<int64_t>(1, block_k_limit / config.block_k());
+            return config.split_k() >
+                   std::min<int64_t>(max_split_k, per_config_split_k_limit);
+          }),
       configs.end());
+
+  // Decrease the block sizes if they are unnecessarily big.
+  for (AutotuneResult::TritonGemmKey& config : configs) {
+    config.set_block_m(std::min(block_m_limit, config.block_m()));
+    config.set_block_n(std::min(block_n_limit, config.block_n()));
+    config.set_block_k(std::min(block_k_limit, config.block_k()));
+  }
+
+  // Remove duplicates.
+  absl::flat_hash_set<std::string> configs_so_far;
+  configs.erase(
+      std::remove_if(
+          configs.begin(), configs.end(),
+          [&](const AutotuneResult::TritonGemmKey& config) {
+            return !configs_so_far.insert(config.ShortDebugString()).second;
+          }),
+      configs.end());
+
+  CHECK(!configs.empty());
   return configs;
 }
 
@@ -814,10 +869,10 @@ std::vector<AutotuneResult::TritonGemmKey> GetPossibleMatmulAutotuneConfigs(
                                       kMaxTileSize /
                                       ShapeUtil::ElementsIn(dot.shape()))
           : 1;
-  return exhaustive_tiling_search
-             ? GetExhaustiveMatmulAutotuneConfigs(compute_capability,
-                                                  max_split_k)
-             : GetFixedMatmulAutotuneConfigs(compute_capability, max_split_k);
+  return exhaustive_tiling_search ? GetExhaustiveMatmulAutotuneConfigs(
+                                        compute_capability, max_split_k)
+                                  : GetFixedMatmulAutotuneConfigs(
+                                        dot, compute_capability, max_split_k);
 }
 
 StatusOr<bool> TritonAutotuner::Run(
