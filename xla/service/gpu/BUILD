@@ -3,7 +3,7 @@
 
 load("//xla/tests:build_defs.bzl", "xla_test")
 load("@bazel_skylib//rules:common_settings.bzl", "bool_flag")
-load("//xla:xla.bzl", "xla_cc_test", "xla_cub_deps", "xla_export_hlo_deps")
+load("//xla:xla.bzl", "xla_cc_test", "xla_export_hlo_deps")
 load(
     "//xla/service/gpu:build_defs.bzl",
     "build_cub_sort_kernels",
@@ -253,7 +253,9 @@ cc_library(
     name = "ir_emitter_unnested",
     srcs = ["ir_emitter_unnested.cc"],
     hdrs = ["ir_emitter_unnested.h"],
-    local_defines = if_cuda_is_configured(["GOOGLE_CUDA=1"]) + if_rocm_is_configured(["TENSORFLOW_USE_ROCM=1"]) + if_rocm_hipblaslt([
+    local_defines = if_cuda_is_configured(["GOOGLE_CUDA=1"]) + if_rocm_is_configured([
+        "TENSORFLOW_USE_ROCM=1",
+    ]) + if_rocm_hipblaslt([
         "TF_HIPBLASLT=1",
     ]),
     deps = [
@@ -1086,14 +1088,30 @@ cc_library(
 )
 
 cc_library(
+    name = "gpu_prim_hdrs",
+    hdrs = ["gpu_prim.h"],
+    deps = [
+        "@eigen_archive//:eigen3",
+        "@tsl//tsl/platform:bfloat16",
+    ] + if_cuda_is_configured([
+        "//third_party/gpus/cub",
+    ]) + if_rocm_is_configured([
+        "@local_config_rocm//rocm:rocprim",
+    ]),
+)
+
+cc_library(
     name = "cub_sort_thunk",
     srcs = if_gpu_is_configured(["cub_sort_thunk.cc"]),
     hdrs = if_gpu_is_configured(["cub_sort_thunk.h"]),
+    local_defines = if_cuda_is_configured(["GOOGLE_CUDA=1"]) + if_rocm_is_configured([
+        "TENSORFLOW_USE_ROCM=1",
+    ]),
     deps = if_gpu_is_configured([
         ":buffer_allocations",
         ":thunk",
         "@com_google_absl//absl/log:check",
-        "@local_config_cuda//cuda:cuda_headers",
+        ":gpu_prim_hdrs",
         "//xla/service:buffer_assignment",
         "//xla:shape_util",
         "//xla/stream_executor:device_memory",
@@ -1110,7 +1128,8 @@ build_cub_sort_kernels(
     deps = if_gpu_is_configured([
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/strings",
-    ] + xla_cub_deps()),
+        ":gpu_prim_hdrs",
+    ]),
 )
 
 cc_library(
