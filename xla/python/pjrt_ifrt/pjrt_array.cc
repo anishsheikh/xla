@@ -22,6 +22,7 @@ limitations under the License.
 #include <vector>
 
 #include "absl/log/check.h"
+#include "absl/status/status.h"
 #include "absl/strings/str_join.h"
 #include "xla/literal.h"
 #include "xla/pjrt/pjrt_client.h"
@@ -381,35 +382,40 @@ StatusOr<tsl::RCReference<Array>> PjRtArray::Reshard(
             "first fetched to the host and then sent to the destination "
             "device.");
       }
-      // Use `PjRtBuffer::CopyToMemorySpace` instead of
+      if (new_sharding_has_memory_kind && memories_supported &&
+          semantics == ArrayCopySemantics::kDonateInput && !memory_kind_equal) {
+        return Unimplemented(
+            "Donation across different memory kinds is not implemented.");
+      }
+      // Try using `PjRtBuffer::CopyToMemorySpace` instead of
       // `PjRtBuffer::CopyToDevice` when memories are supported. Because the
       // semantics of the latter one is to copy to the default memory space of
       // the device.
+      std::unique_ptr<PjRtBuffer> copied_buffer = nullptr;
       if (new_sharding_has_memory_kind && memories_supported) {
         TF_ASSIGN_OR_RETURN(
             auto memory_space,
             GetMemorySpaceFromMemoryKind(new_sharding->devices()[i],
                                          canonicalized_sharding_memory_kind));
-        TF_ASSIGN_OR_RETURN(std::unique_ptr<PjRtBuffer> copied_buffer,
-                            pjrt_buffers_[i]->CopyToMemorySpace(memory_space));
-        if (semantics == ArrayCopySemantics::kDonateInput) {
-          if (!memory_kind_equal) {
-            return Unimplemented(
-                "Donation across different memory kinds is not implemented.");
-          }
-          pjrt_buffers_[i] = nullptr;
+        StatusOr<std::unique_ptr<PjRtBuffer>> copied_buffer_using_memory_space =
+            pjrt_buffers_[i]->CopyToMemorySpace(memory_space);
+        if (copied_buffer_using_memory_space.ok()) {
+          copied_buffer = std::move(copied_buffer_using_memory_space.value());
+        } else if (!absl::IsUnimplemented(
+                       copied_buffer_using_memory_space.status())) {
+          return copied_buffer_using_memory_space.status();
         }
-        buffers.push_back(std::shared_ptr<PjRtBuffer>(copied_buffer.release()));
-      } else {
-        // Use `PjRtBuffer::CopyToDevice` when memories are not supported.
-        TF_ASSIGN_OR_RETURN(
-            std::unique_ptr<xla::PjRtBuffer> copied_buffer,
-            pjrt_buffers_[i]->CopyToDevice(new_sharding->devices()[i]));
-        if (semantics == ArrayCopySemantics::kDonateInput) {
-          pjrt_buffers_[i] = nullptr;
-        }
-        buffers.push_back(std::shared_ptr<PjRtBuffer>(copied_buffer.release()));
       }
+      // Fallback to `PjRtBuffer::CopyToDevice` if memories are not supported or
+      // `PjRtBuffer::CopyToMemorySpace` returns unimplemented error.
+      if (copied_buffer == nullptr) {
+        TF_ASSIGN_OR_RETURN(copied_buffer, pjrt_buffers_[i]->CopyToDevice(
+                                               new_sharding->devices()[i]));
+      }
+      if (semantics == ArrayCopySemantics::kDonateInput) {
+        pjrt_buffers_[i] = nullptr;
+      }
+      buffers.push_back(std::shared_ptr<PjRtBuffer>(copied_buffer.release()));
     }
   }
   return PjRtArray::Create(client_, dtype_, shape_, std::move(new_sharding),
