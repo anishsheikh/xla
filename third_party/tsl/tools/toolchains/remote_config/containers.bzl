@@ -1,11 +1,11 @@
 """Docker images used with remote config and RBE."""
 
-"""SHA 256 values for each image."""
+# SHA 256 values for each image.
 container_digests = {
     # TF now uses only this container
     "cuda11.2-cudnn8.1-ubuntu20.04-manylinux2014-multipython": "sha256:48612bd85709cd014711d0b0f87e0806f3567d06d2e81c6e860516b87498b821",
     # JAX manylinux2014 configs.
-    "cuda11.8-cudnn8.6-ubuntu20.04-manylinux2014-multipython": "sha256:77234e5750afcf85c08e8980eff2e8c58ba207a0c32b06a372cafb687d144d2b",
+    "cuda11.8-cudnn8.6-ubuntu20.04-manylinux2014-multipython": "sha256:5952990d98575017be275de70496714c6afe2d7c9d3aa2032706550de9996bbf",
     "cuda12.2-cudnn8.9-ubuntu20.04-manylinux2014-multipython": "sha256:b699d6ae235ac601dc3e62391ac7c4606cb10331f8141983858c1580f5e74ddb",
     # ROCM, probably not all of them still in use
     "rocm-ubuntu18.04-manylinux2010-multipython": "sha256:6e953a09b145df338bcb03e9e36f99b291140c29b72d0a048fb6c5905ccad5eb",
